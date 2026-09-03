@@ -1024,6 +1024,8 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes
                 self.__write_payload(op)
             else:
                 self.__write_payload(op)
+            if self.__check_read_finished():
+                return MAVFTPReturn("BurstReadFile", FtpError.Success)
             if op.burst_complete:
                 if op.size > 0 and op.size < self.burst_size:
                     # a burst complete with non-zero size and less than burst packet size
