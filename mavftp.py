@@ -2478,6 +2478,7 @@ def auto_detect_serial() -> List[mavutil.SerialPort]:
         "*Ardu*",
         "*PX4*",
         "*Hex_*",
+        "*ProfiCNC*",
         "*Holybro_*",
         "*mRo*",
         "*FMU*",
@@ -2485,6 +2486,7 @@ def auto_detect_serial() -> List[mavutil.SerialPort]:
         "*Serial*",
         "*CubePilot*",
         "*Qiotek*",
+        "*Matek*",
     ]
     serial_list: List[mavutil.SerialPort] = mavutil.auto_detect_serial(
         preferred_list=preferred_ports
