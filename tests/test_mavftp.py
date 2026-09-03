@@ -458,6 +458,29 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
             OP_BurstReadFile, [sent[-1][3] for sent in master.mav.sent[1:]]
         )
 
+    def test_read_sector_memory_uses_range_relative_offset(self):
+        """A range read buffer must scale with the range, not remote offset."""
+        ftp, _master = self.make_ftp([])
+        ftp.fh = BytesIO()
+        ftp.filename = "remote"
+        ftp.read_to_memory = True
+        ftp.requested_offset = 1024 * 1024
+
+        ftp._MAVFTP__write_payload(  # pylint: disable=protected-access
+            FTP_OP(
+                seq=1,
+                session=0,
+                opcode=OP_Ack,
+                size=2,
+                req_opcode=OP_BurstReadFile,
+                burst_complete=0,
+                offset=ftp.requested_offset,
+                payload=bytearray(b"xy"),
+            )
+        )
+
+        self.assertEqual(ftp.fh.getvalue(), b"xy")
+
     def test_put_returns_after_completion_before_late_write_reply(self):
         ftp, master = self.make_ftp(
             [
