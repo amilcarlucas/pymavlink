@@ -152,7 +152,7 @@ def run(device: str, baud: int, component: int) -> None:  # pylint: disable=too-
         result = ftp.cmd_put(["-", remote], fh=io.BytesIO(payload))
         if result.error_code != FtpError.Success:
             raise RuntimeError(f"upload setup failed: {result.error_code.name}")
-        result = ftp.process_ftp_reply("CreateFile", timeout=60)
+        result = ftp.process_ftp_reply("put", timeout=60)
         print(f"upload: {result.error_code.name}", flush=True)
         if result.error_code != FtpError.Success:
             raise RuntimeError(f"upload failed: {result.error_code.name}")

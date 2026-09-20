@@ -113,6 +113,7 @@ FTP_SESSION_MODULUS = 1 << 8
 BURST_REPLY_SEQUENCE_WINDOW = 4096
 MAX_READ_GAPS = 4096
 MAX_READ_RETRIES = 10
+MAX_INITIAL_RETRIES = 3
 READ_DEADLINE_SECONDS = 5.0
 # Keep a batch of encoded MAVLink packets below a normal Ethernet MTU.  This
 # is used only when the underlying pymavlink link supports collecting writes.
@@ -621,9 +622,9 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         self.last_rx_deadline = 0.0
         self._rx_loss_applied = False
         self._ftp_reply_processing_depth = 0
-        # ``get_result`` is the result buffer for synchronous ``read()``.
-        # File downloads deliberately stream to a staging file and therefore
-        # do not retain a second, whole-file in-memory copy.
+        # ``get_result`` is the result buffer for synchronous ``read()`` and
+        # stdout downloads. File downloads deliberately stream to a staging
+        # file and do not retain a second, whole-file in-memory copy.
         self.get_result: Union[None, bytes] = None
         self.last_crc: Optional[int] = None
         self.crccmp_results: List[str] = []
@@ -681,18 +682,22 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         logging.error(usage)
         return MAVFTPReturn("FTP command", FtpError.InvalidArguments)
 
-    def __send(
+    def __send(  # pylint: disable=too-many-branches
         self,
         op: FTP_OP,
         retry: bool = False,
         writer: Optional[Any] = None,
-    ) -> None:  # pylint: disable=too-many-branches
+    ) -> None:
         """Send a request, preserving its sequence number on retransmission."""
         if not retry:
             op.seq = self.seq
             self.request_retries = 0
             self.session_waiting = False
             self.last_op_reply = False
+        else:
+            # A NoSessionsAvailable NACK delays the next retry, but must not
+            # suppress the retry budget once that retry has been sent.
+            self.session_waiting = False
         payload = op.pack()
         plen = len(payload)
         if plen < MAX_Payload + HDR_Len:
@@ -757,17 +762,6 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 mav.total_packets_sent += 1
             if hasattr(mav, "total_bytes_sent"):
                 mav.total_bytes_sent += len(packet)
-            send_callback = getattr(mav, "send_callback", None)
-            if (
-                send_callback is not None
-                and getattr(mav, "send_callback_args", None) is not None
-                and getattr(mav, "send_callback_kwargs", None) is not None
-            ):
-                send_callback(
-                    message,
-                    *mav.send_callback_args,
-                    **mav.send_callback_kwargs,
-                )
             return
         self.master.mav.file_transfer_protocol_send(
             self.network, self.target_system, self.target_component, payload
@@ -930,7 +924,21 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 self.__send(operation)
             return
 
-        link = self.master.mav.file
+        mav = self.master.mav
+        signing = getattr(mav, "signing", None)
+        # Packing a signed packet consumes both the MAVLink sequence and the
+        # signing timestamp. A send callback (or another sender sharing the
+        # MAVLink instance) can send before the held batch is flushed, making
+        # the deferred packets appear to have old signatures at the receiver.
+        # Use the normal send path whenever that ordering matters.
+        if getattr(signing, "sign_outgoing", False) or getattr(
+            mav, "send_callback", None
+        ) is not None:
+            for operation in operations:
+                self.__send(operation)
+            return
+
+        link = mav.file
         collector = MAVLinkBatchWriter()
         for operation in operations:
             self.__send(operation, writer=collector)
@@ -1228,7 +1236,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         more.offset = 0
         self.__send(more)
 
-    def __handle_list_reply(  # pylint: disable=too-many-boolean-expressions,too-many-branches,too-many-statements,too-many-return-statements
+    def __handle_list_reply(  # pylint: disable=too-many-boolean-expressions,too-many-branches,too-many-statements
         self, op: FTP_OP, _m
     ) -> MAVFTPReturn:
         """Handle OP_ListDirectory reply."""
@@ -1682,17 +1690,12 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                     result = self.fh.read()
                     actual_size = len(result)
                 elif self.temp_filename is not None:
-                    # ``cmd_get`` historically exposed the completed bytes
-                    # through ``get_result``. Keep that public API while the
-                    # transfer itself still uses a staging file.
                     actual_size = os.fstat(self.fh.fileno()).st_size
-                    self.fh.seek(0)
-                    result = self.fh.read()
                 else:
                     result = b""
                 if self.read_to_memory:
                     self.get_result = result[: self.requested_size]
-                elif self.filename in ("-",) or self.temp_filename is not None:
+                elif self.filename == "-":
                     self.get_result = result
                 if not self.read_to_memory and not self.remote_size_known:
                     self.requested_size = max(0, actual_size - self.requested_offset)
@@ -2995,6 +2998,11 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 or (self.reached_eof and not reached_eof_before_reply)
                 or len(self.read_gaps) < read_gaps_before_reply
             )
+            # The retry limit protects a continuous burst stall, not an
+            # entire download. An accepted payload, EOF, or gap repair proves
+            # that the link made forward progress and starts a fresh window.
+            if op.req_opcode in {OP_BurstReadFile, OP_ReadFile} and read_progressed:
+                self.read_retries = 0
             if op.req_opcode not in {OP_BurstReadFile, OP_ReadFile} or read_progressed:
                 self.accepted_reply_generation += 1
 
@@ -3106,7 +3114,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         ):
             self.op_start = now
             self.open_retries += 1
-            if self.open_retries > 2 and not self.session_waiting:
+            if self.open_retries > MAX_READ_RETRIES:
                 # fail the get
                 self.op_start = None
                 self.__terminate_session()
@@ -3115,13 +3123,24 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 logging.info("FTP: retry open")
             self.__send(self.last_op, retry=True)
 
-        # Directory reads are safe to replay. Mutating operations must not be
-        # retried after a lost ACK: the server may already have applied them.
+        # Reuse the request sequence for one-reply operations. MAVFTP servers
+        # commonly cache the reply for that sequence, which makes a retry
+        # recover a lost request or ACK without repeating the operation.
+        # Limit this to a few exponentially delayed attempts because servers
+        # that do not cache requests can still apply a mutation more than once.
         initial_opcodes = {
             OP_ListDirectory,
             OP_ListDirectoryWithTime,
+            OP_CreateFile,
+            OP_RemoveFile,
+            OP_RemoveDirectory,
+            OP_Rename,
+            OP_CreateDirectory,
+            OP_CalcFileCRC32,
         }
-        retry_timeout = self.retry_timeout()
+        retry_timeout = self.retry_timeout() * 2 ** min(
+            self.request_retries, MAX_INITIAL_RETRIES - 1
+        )
         if (
             self.last_op is not None
             and not self.last_op_reply
@@ -3133,23 +3152,13 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             )
             and now - self.last_op_time > retry_timeout
         ):
-            if self.request_retries >= 10:
+            if self.request_retries >= MAX_INITIAL_RETRIES:
                 logging.error("FTP: request timed out: %s", self.last_op)
                 self.__terminate_session()
                 return False
             if self.ftp_settings.debug > 0:
                 logging.info("FTP: retry request %s", self.last_op)
             self.__send(self.last_op, retry=True)
-            return False
-
-        # CRC requests can take longer than the normal idle window. Do not
-        # retransmit them, but keep the caller's overall timeout in control of
-        # how long the remote calculation may run.
-        if (
-            self.last_op is not None
-            and self.last_op.opcode == OP_CalcFileCRC32
-            and not self.last_op_reply
-        ):
             return False
 
         if (
@@ -3395,6 +3404,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                         operation_name.lower() == "put"
                         and self.completed_reply is not None
                         and self.completed_reply[0] in {OP_CreateFile, OP_WriteFile}
+                        and addressed_to_us
                     )
                     if (
                         reply_matches_last_op
