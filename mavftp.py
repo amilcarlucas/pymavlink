@@ -112,6 +112,8 @@ FTP_SEQ_MODULUS = 1 << 16
 FTP_SESSION_MODULUS = 1 << 8
 BURST_REPLY_SEQUENCE_WINDOW = 4096
 MAX_READ_GAPS = 4096
+MAX_READ_RETRIES = 10
+READ_DEADLINE_SECONDS = 5.0
 # Keep a batch of encoded MAVLink packets below a normal Ethernet MTU.  This
 # is used only when the underlying pymavlink link supports collecting writes.
 MAX_NETWORK_BATCH = 1200
@@ -785,7 +787,10 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             self.__transmit_payload(payload)
         while self.rx_delay_queue and self.rx_delay_queue[0][0] <= now:
             _, _, message = heapq.heappop(self.rx_delay_queue)
-            addressed_to_us = self.__reply_addressed_to_local_client(message)
+            addressed_to_us = (
+                self.__reply_addressed_to_local_client(message)
+                and self.__reply_from_configured_target(message)
+            )
             if addressed_to_us:
                 try:
                     op = self.__op_parse(message)
@@ -1339,7 +1344,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             self.seq, self.session, OP_OpenFileRO, len(enc_fname), 0, 0, 0, enc_fname
         )
         self.__send(op)
-        timeout = time.time() + 5
+        timeout = time.time() + READ_DEADLINE_SECONDS
         accepted_reply_generation = self.accepted_reply_generation
         if self.master is None:
             return None
@@ -1354,7 +1359,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                     accepted_before_idle = self.accepted_reply_generation
                     self.idle_task()
                     if accepted_before_idle != self.accepted_reply_generation:
-                        timeout = time.time() + 5
+                        timeout = time.time() + READ_DEADLINE_SECONDS
                         accepted_reply_generation = self.accepted_reply_generation
                     continue
                 self.__receive_packet(m)
@@ -1363,14 +1368,14 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 # turn this into an unbounded wait: only a reply accepted by
                 # the active transfer is progress for this deadline.
                 if accepted_reply_generation != self.accepted_reply_generation:
-                    timeout = time.time() + 5
+                    timeout = time.time() + READ_DEADLINE_SECONDS
                     accepted_reply_generation = self.accepted_reply_generation
             except TypeError as e:
                 logging.error(e)
             accepted_before_idle = self.accepted_reply_generation
             self.idle_task()
             if accepted_before_idle != self.accepted_reply_generation:
-                timeout = time.time() + 5
+                timeout = time.time() + READ_DEADLINE_SECONDS
                 accepted_reply_generation = self.accepted_reply_generation
             time.sleep(0.0001)
         logging.info("loop closed, gaps:%u, done: %u", len(self.read_gaps), self.done)
@@ -1787,7 +1792,6 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             logging.warning("FTP: Unexpected burst read reply. Will be discarded")
             logging.info(op)
             return MAVFTPReturn("BurstReadFile", FtpError.Fail)
-        self.last_burst_read = time.time()
         size = len(op.payload) if op.payload is not None else 0
         if size > self.burst_size:
             # this server doesn't handle the burst size argument
@@ -1846,6 +1850,8 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                     return self.callback_failure or MAVFTPReturn(
                         "BurstReadFile", FtpError.Fail
                     )
+                if size > 0:
+                    self.last_burst_read = time.time()
                 self.__seek_read_position(ofs)
                 if self.__check_read_finished():
                     return self.callback_failure or MAVFTPReturn(
@@ -1876,11 +1882,15 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                     return self.callback_failure or MAVFTPReturn(
                         "BurstReadFile", FtpError.Fail
                     )
+                if size > 0:
+                    self.last_burst_read = time.time()
             else:
                 if not self.__write_payload(op):
                     return self.callback_failure or MAVFTPReturn(
                         "BurstReadFile", FtpError.Fail
                     )
+                if size > 0:
+                    self.last_burst_read = time.time()
             # Burst replies have their own advancing sequence stream.  Keep
             # future requests beyond every accepted reply so a new download
             # cannot reuse a stale reply sequence when a server reuses a
@@ -2859,8 +2869,6 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         # Only an active reply demonstrates progress; stale packets must not
         # postpone retransmission of the request that is still outstanding.
         self.last_op_time = now
-        self.accepted_reply_generation += 1
-
         if (
             self.last_op is not None
             and op.req_opcode == self.last_op.opcode
@@ -2876,68 +2884,80 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         if sent is not None:
             self.update_rtt(now - sent)
 
-        if (
-            op.opcode == OP_Nack
-            and op.payload is not None
-            and len(op.payload) == 1
-            and op.payload[0] == FtpError.NoSessionsAvailable
-            and op.req_opcode
-            in {
-                OP_ListDirectory,
-                OP_ListDirectoryWithTime,
-                OP_OpenFileRO,
-                OP_CreateFile,
-                OP_RemoveFile,
-                OP_RemoveDirectory,
-                OP_Rename,
-                OP_CreateDirectory,
-                OP_CalcFileCRC32,
-            }
-        ):
-            # Another client may have consumed the server's session table.
-            # Keep the current operation intact and let idle processing retry
-            # it instead of failing a callback or tearing down a valid local
-            # upload/download setup.
-            self.session_waiting = True
-            self.last_op_reply = False
-            self.last_op_time = now
-            return self.__decode_ftp_ack_and_nack(op)
-
-        if op.req_opcode in {OP_ListDirectory, OP_ListDirectoryWithTime}:
-            return self.__handle_list_reply(op, m)
-        if op.req_opcode == OP_OpenFileRO:
-            return self.__handle_open_ro_reply(op, m)
-        if op.req_opcode == OP_BurstReadFile:
-            return self.__handle_burst_read(op, m)
-        if op.req_opcode == OP_ResetSessions:
-            return self.__handle_reset_sessions_reply(op, m)
-        if op.req_opcode in {OP_None, OP_TerminateSession}:
+        read_total_before_reply = self.read_total
+        reached_eof_before_reply = self.reached_eof
+        read_gaps_before_reply = len(self.read_gaps)
+        try:
             if (
-                op.req_opcode == OP_TerminateSession
-                and self.pending_terminate_seq is not None
-                and op.seq == (self.pending_terminate_seq + 1) % FTP_SEQ_MODULUS
+                op.opcode == OP_Nack
+                and op.payload is not None
+                and len(op.payload) == 1
+                and op.payload[0] == FtpError.NoSessionsAvailable
+                and op.req_opcode
+                in {
+                    OP_ListDirectory,
+                    OP_ListDirectoryWithTime,
+                    OP_OpenFileRO,
+                    OP_CreateFile,
+                    OP_RemoveFile,
+                    OP_RemoveDirectory,
+                    OP_Rename,
+                    OP_CreateDirectory,
+                    OP_CalcFileCRC32,
+                }
             ):
-                # Ack or Nack (InvalidSession means it was already
-                # closed): the handshake has been answered
-                self.pending_terminate_seq = None
-            return MAVFTPReturn(operation_name, FtpError.Success)  # ignore reply
-        if op.req_opcode == OP_CreateFile:
-            return self.__handle_create_file_reply(op, m)
-        if op.req_opcode == OP_WriteFile:
-            return self.__handle_write_reply(op, m)
-        if op.req_opcode in {OP_RemoveFile, OP_RemoveDirectory}:
-            return self.__handle_remove_reply(op, m)
-        if op.req_opcode == OP_Rename:
-            return self.__handle_rename_reply(op, m)
-        if op.req_opcode == OP_CreateDirectory:
-            return self.__handle_mkdir_reply(op, m)
-        if op.req_opcode == OP_ReadFile:
-            return self.__handle_reply_read(op, m)
-        if op.req_opcode == OP_CalcFileCRC32:
-            return self.__handle_crc_reply(op, m)
+                # Another client may have consumed the server's session table.
+                # Keep the current operation intact and let idle processing retry
+                # it instead of failing a callback or tearing down a valid local
+                # upload/download setup.
+                self.session_waiting = True
+                self.last_op_reply = False
+                self.last_op_time = now
+                return self.__decode_ftp_ack_and_nack(op)
 
-        logging.info("FTP Unknown %s", str(op))
-        return MAVFTPReturn(operation_name, FtpError.InvalidOpcode)
+            if op.req_opcode in {OP_ListDirectory, OP_ListDirectoryWithTime}:
+                return self.__handle_list_reply(op, m)
+            if op.req_opcode == OP_OpenFileRO:
+                return self.__handle_open_ro_reply(op, m)
+            if op.req_opcode == OP_BurstReadFile:
+                return self.__handle_burst_read(op, m)
+            if op.req_opcode == OP_ResetSessions:
+                return self.__handle_reset_sessions_reply(op, m)
+            if op.req_opcode in {OP_None, OP_TerminateSession}:
+                if (
+                    op.req_opcode == OP_TerminateSession
+                    and self.pending_terminate_seq is not None
+                    and op.seq == (self.pending_terminate_seq + 1) % FTP_SEQ_MODULUS
+                ):
+                    # Ack or Nack (InvalidSession means it was already
+                    # closed): the handshake has been answered
+                    self.pending_terminate_seq = None
+                return MAVFTPReturn(operation_name, FtpError.Success)  # ignore reply
+            if op.req_opcode == OP_CreateFile:
+                return self.__handle_create_file_reply(op, m)
+            if op.req_opcode == OP_WriteFile:
+                return self.__handle_write_reply(op, m)
+            if op.req_opcode in {OP_RemoveFile, OP_RemoveDirectory}:
+                return self.__handle_remove_reply(op, m)
+            if op.req_opcode == OP_Rename:
+                return self.__handle_rename_reply(op, m)
+            if op.req_opcode == OP_CreateDirectory:
+                return self.__handle_mkdir_reply(op, m)
+            if op.req_opcode == OP_ReadFile:
+                return self.__handle_reply_read(op, m)
+            if op.req_opcode == OP_CalcFileCRC32:
+                return self.__handle_crc_reply(op, m)
+
+            logging.info("FTP Unknown %s", str(op))
+            return MAVFTPReturn(operation_name, FtpError.InvalidOpcode)
+        finally:
+            read_progressed = (
+                self.read_total > read_total_before_reply
+                or (self.reached_eof and not reached_eof_before_reply)
+                or len(self.read_gaps) < read_gaps_before_reply
+            )
+            if op.req_opcode not in {OP_BurstReadFile, OP_ReadFile} or read_progressed:
+                self.accepted_reply_generation += 1
 
     def __send_gap_read(self, g) -> None:
         """Send a read for a gap."""
@@ -3120,6 +3140,12 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             and self.last_burst_read is not None
             and now - self.last_burst_read > self.retry_timeout()
         ):
+            if self.read_retries >= MAX_READ_RETRIES:
+                logging.error(
+                    "FTP: burst read timed out after %u retries", self.read_retries
+                )
+                self.__terminate_session()
+                return False
             dt = now - self.last_burst_read
             self.last_burst_read = now
             if self.ftp_settings.debug > 0:
@@ -3205,7 +3231,10 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                     # A recipient check does not require decoding the FTP
                     # payload.  Do it first so malformed traffic for another
                     # GCS cannot turn into a local InvalidDataSize result.
-                    if not self.__reply_addressed_to_local_client(m):
+                    if (
+                        not self.__reply_addressed_to_local_client(m)
+                        or not self.__reply_from_configured_target(m)
+                    ):
                         self.__receive_packet(m)
                     elif operation_name == "TerminateSession":
                         # The normal packet path validates target, session and
@@ -3321,6 +3350,10 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                         break
                     if operation_name == "TerminateSession":
                         if not addressed_to_us:
+                            continue
+                        if self.pending_terminate_seq is not None and not (
+                            reply_matches_last_op or reply_matches_active_request
+                        ):
                             continue
                         if self.pending_terminate_seq is None:
                             ret = MAVFTPReturn(operation_name, FtpError.Success)

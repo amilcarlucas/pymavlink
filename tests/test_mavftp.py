@@ -29,6 +29,7 @@ from pymavlink.mavftp import (
     FTP_SEQ_MODULUS,
     FTP_SESSION_MODULUS,
     MAX_READ_GAPS,
+    MAX_READ_RETRIES,
     MAVFTP,
     MAVFTPSetting,
     MAVFTPSettings,
@@ -69,6 +70,14 @@ class FakeFTPMessage:  # pylint: disable=too-few-public-methods
     def get_type():
         return "FILE_TRANSFER_PROTOCOL"
 
+    @staticmethod
+    def get_srcSystem():
+        return 1
+
+    @staticmethod
+    def get_srcComponent():
+        return 1
+
 
 class RawFTPMessage:  # pylint: disable=too-few-public-methods
     """Minimal raw FTP message used to exercise malformed-packet handling."""
@@ -81,6 +90,14 @@ class RawFTPMessage:  # pylint: disable=too-few-public-methods
     @staticmethod
     def get_type():
         return "FILE_TRANSFER_PROTOCOL"
+
+    @staticmethod
+    def get_srcSystem():
+        return 1
+
+    @staticmethod
+    def get_srcComponent():
+        return 1
 
 
 class OSWithoutFchmod:  # pylint: disable=too-few-public-methods
@@ -656,6 +673,78 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         self.assertEqual(result.error_code, FtpError.Fail)
 
+    def test_delayed_wrong_vehicle_malformed_reply_is_not_local_malformed(self):
+        """The delayed receive path filters the vehicle before parsing payloads."""
+        foreign = RawFTPMessage(b"bad")
+        foreign.get_srcSystem = lambda: 2
+        local = FakeFTPMessage(
+            FTP_OP(
+                seq=1,
+                session=0,
+                opcode=OP_Ack,
+                size=0,
+                req_opcode=OP_ResetSessions,
+                burst_complete=0,
+                offset=0,
+                payload=None,
+            )
+        )
+        master = FakeMaster([foreign, local], validate_replies=False)
+        ftp, _old_master = self.make_ftp([])
+        ftp.master = master
+        ftp.ftp_settings.pkt_lag_rx = 1.0
+        ftp.last_op = FTP_OP(
+            seq=0,
+            session=ftp.session,
+            opcode=OP_ResetSessions,
+            size=0,
+            req_opcode=0,
+            burst_complete=0,
+            offset=0,
+            payload=None,
+        )
+        ftp.pending_reset_seq = 0
+
+        with (
+            patch(
+                "pymavlink.mavftp.time.monotonic",
+                side_effect=[0.0, 0.0, 0.0, 1.0],
+            ),
+            patch.object(ftp, "_MAVFTP__idle_task", return_value=False),
+        ):
+            result = ftp.process_ftp_reply("ResetSessions", timeout=1)
+
+        self.assertEqual(result.error_code, FtpError.Success)
+
+
+    def test_delayed_wrong_session_terminate_reply_is_not_accepted(self):
+        """A valid packet for another FTP session must not satisfy termination."""
+        ftp, _master = self.make_ftp([])
+        packet = FakeFTPMessage(
+            FTP_OP(
+                seq=1,
+                session=(ftp.session + 1) % FTP_SESSION_MODULUS,
+                opcode=OP_Ack,
+                size=0,
+                req_opcode=OP_TerminateSession,
+                burst_complete=0,
+                offset=0,
+                payload=None,
+            )
+        )
+        ftp.pending_terminate_seq = 0
+        ftp.rx_delay_queue = [(0.0, 1, packet)]
+
+        with (
+            patch("pymavlink.mavftp.time.monotonic", return_value=1.0),
+            patch.object(ftp.master, "recv_match", return_value=None),
+            patch.object(ftp, "idle_task", return_value=True) as idle,
+        ):
+            result = ftp.process_ftp_reply("TerminateSession", timeout=1)
+
+        idle.assert_called_once()
+        self.assertEqual(result.error_code, FtpError.Fail)
+
 
     def test_reply_from_another_vehicle_is_rejected(self):
         """A colliding session reply from another vehicle cannot complete a command."""
@@ -848,6 +937,18 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         """A malformed packet for another client cannot abort this client's receive loop."""
         malformed = RawFTPMessage(b"\x00" * 3)
         malformed.target_system = 99
+        ftp, _master = self.make_ftp(
+            [malformed, ftp_reply(2, OP_Ack, OP_RemoveFile)]
+        )
+
+        result = ftp.cmd_ftp(["rm", "remote"])
+
+        self.assertEqual(result.error_code, FtpError.Success)
+
+    def test_process_ignores_malformed_reply_from_another_vehicle(self):
+        """A malformed packet from another vehicle cannot abort this client's receive loop."""
+        malformed = RawFTPMessage(b"\x00" * 3)
+        malformed.get_srcSystem = lambda: 2
         ftp, _master = self.make_ftp(
             [malformed, ftp_reply(2, OP_Ack, OP_RemoveFile)]
         )
@@ -3385,6 +3486,110 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(result.error_code, FtpError.Success)
         self.assertEqual(ftp.duplicates, 0)
 
+    def test_duplicate_burst_reply_does_not_count_as_progress(self):
+        """A duplicate burst packet must not renew read progress or stall time."""
+        ftp, _master = self.make_ftp([])
+        ftp.fh = BytesIO()
+        ftp.filename = "remote.bin"
+        ftp.read_to_memory = True
+        ftp.requested_offset = 0
+        ftp.requested_size = 2
+        ftp.burst_size = 239
+        ftp.session = 1
+        ftp.pending_burst_seq = 1
+        ftp.pending_burst_offset = 0
+        reply = FTP_OP(
+            seq=1,
+            session=1,
+            opcode=OP_Ack,
+            size=1,
+            req_opcode=OP_BurstReadFile,
+            burst_complete=0,
+            offset=0,
+            payload=b"x",
+        )
+        packet = FakeFTPMessage(reply)
+
+        first_result = ftp.mavlink_packet(packet)
+        generation_after_first = ftp.accepted_reply_generation
+        last_burst_after_first = ftp.last_burst_read
+        second_result = ftp.mavlink_packet(packet)
+
+        self.assertEqual(first_result.error_code, FtpError.Success)
+        self.assertEqual(second_result.error_code, FtpError.Fail)
+        self.assertEqual(ftp.accepted_reply_generation, generation_after_first)
+        self.assertEqual(ftp.last_burst_read, last_burst_after_first)
+        self.assertEqual(ftp.duplicates, 1)
+
+    def test_zero_byte_advancing_burst_does_not_count_gap_creation_as_progress(self):
+        """An empty out-of-order burst reply must not renew the read deadline."""
+        ftp, _master = self.make_ftp([])
+        ftp.fh = BytesIO()
+        ftp.filename = "remote.bin"
+        ftp.read_to_memory = True
+        ftp.requested_offset = 0
+        ftp.requested_size = 2
+        ftp.burst_size = 239
+        ftp.session = 1
+        ftp.pending_burst_seq = 1
+        ftp.pending_burst_offset = 0
+        ftp.last_burst_read = 10.0
+        accepted_before = ftp.accepted_reply_generation
+        packet = FakeFTPMessage(
+            FTP_OP(
+                seq=1,
+                session=1,
+                opcode=OP_Ack,
+                size=0,
+                req_opcode=OP_BurstReadFile,
+                burst_complete=0,
+                offset=1,
+                payload=b"",
+            )
+        )
+
+        result = ftp.mavlink_packet(packet)
+
+        self.assertEqual(result.error_code, FtpError.Success)
+        self.assertEqual(ftp.read_total, 0)
+        self.assertFalse(ftp.reached_eof)
+        self.assertEqual(len(ftp.read_gaps), 1)
+        self.assertEqual(ftp.accepted_reply_generation, accepted_before)
+        self.assertEqual(ftp.last_burst_read, 10.0)
+
+    def test_termination_cleanup_does_not_count_as_read_progress(self):
+        """Resetting EOF during cleanup must not advance burst progress."""
+        ftp, _master = self.make_ftp([])
+        ftp.fh = BytesIO()
+        ftp.filename = "remote.bin"
+        ftp.session = 1
+        ftp.pending_burst_seq = 1
+        ftp.pending_burst_offset = 0
+        ftp.reached_eof = True
+        accepted_before = ftp.accepted_reply_generation
+        packet = FakeFTPMessage(
+            FTP_OP(
+                seq=1,
+                session=1,
+                opcode=OP_Ack,
+                size=0,
+                req_opcode=OP_BurstReadFile,
+                burst_complete=0,
+                offset=0,
+                payload=b"",
+            )
+        )
+
+        def cleanup(_op, _message):
+            ftp.reached_eof = False
+            return MAVFTPReturn("BurstReadFile", FtpError.Success)
+
+        with patch.object(ftp, "_MAVFTP__handle_burst_read", side_effect=cleanup):
+            result = ftp.mavlink_packet(packet)
+
+        self.assertEqual(result.error_code, FtpError.Success)
+        self.assertEqual(ftp.accepted_reply_generation, accepted_before)
+
     def test_stale_burst_reply_sequence_is_discarded_for_reused_session(self):
         """A delayed burst packet must not match a new request in session 0."""
         ftp, _master = self.make_ftp([])
@@ -3823,6 +4028,42 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         request = master.mav.sent[-1][-1]
         self.assertEqual(struct.unpack_from("<I", request, 8)[0], 1080)
+
+    def test_burst_stall_retry_is_capped(self):
+        """A stalled burst must eventually terminate instead of retrying forever."""
+        ftp, _master = self.make_ftp([])
+        ftp.fh = BytesIO()
+        ftp.filename = "remote.bin"
+        ftp.last_burst_read = 0.0
+        ftp.pending_burst_request = FTP_OP(
+            seq=0,
+            session=ftp.session,
+            opcode=OP_BurstReadFile,
+            size=0,
+            req_opcode=0,
+            burst_complete=0,
+            offset=0,
+            payload=None,
+        )
+        terminate = MagicMock(side_effect=lambda: setattr(ftp, "fh", None))
+
+        clock = [0.0]
+
+        def advance_time():
+            clock[0] += 2.0
+            return clock[0]
+
+        with (
+            patch.object(ftp, "_MAVFTP__send") as send,
+            patch.object(ftp, "_MAVFTP__terminate_session", terminate),
+            patch("pymavlink.mavftp.time.time", side_effect=advance_time),
+        ):
+            for _ in range(MAX_READ_RETRIES + 5):
+                ftp._MAVFTP__idle_task()  # pylint: disable=protected-access
+
+        self.assertEqual(send.call_count, MAX_READ_RETRIES)
+        terminate.assert_called_once()
+        self.assertEqual(ftp.read_retries, MAX_READ_RETRIES)
 
     def test_out_of_order_gap_reply_is_dispatched(self):
         ftp, _master = self.make_ftp([])
@@ -4380,6 +4621,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(result.error_code, FtpError.Success)
         self.assertTrue(ftp.read_complete)
         self.assertIsNone(ftp.fh)
+        self.assertIsNone(ftp.callback_failure)
 
     def test_release_staging_ignores_closed_owned_handle(self):
         """Staging cleanup must not leak ValueError from an owned closed handle."""
