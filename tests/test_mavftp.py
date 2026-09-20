@@ -54,6 +54,7 @@ from pymavlink.mavftp import (
     create_argument_parser,
     local_file_crc,
 )
+from tools.test_mavftp_hardware import _check_crc_result
 
 # pylint: disable=protected-access,too-many-lines,duplicate-code
 
@@ -161,9 +162,14 @@ class BatchMAV:  # pylint: disable=too-few-public-methods
 
     def __init__(self, link):
         self.file = link
+        self.observed_files = []
 
     def file_transfer_protocol_send(self, _network, _target_system, _target_component, payload):
         self.file.write(b"F" + bytes(payload))
+
+    def file_transfer_protocol_encode(self, _network, _target_system, _target_component, payload):
+        self.observed_files.append(self.file)
+        return b"F" + bytes(payload)
 
 
 class FakeMaster:  # pylint: disable=too-few-public-methods
@@ -764,7 +770,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
     def test_stale_reply_does_not_delay_request_retry(self):
         """A stale reply cannot restart the active request's retry timer."""
         ftp, _master = self.make_ftp([])
-        ftp.last_op = FTP_OP(1, 0, OP_RemoveFile, 0, 0, 0, 0, bytearray())
+        ftp.last_op = FTP_OP(1, 0, OP_ListDirectory, 0, 0, 0, 0, bytearray())
         ftp.last_op_reply = False
         ftp.last_op_time = 0
         send = MagicMock()
@@ -772,7 +778,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         with patch("pymavlink.mavftp.time.time", return_value=10.0):
             result = ftp._MAVFTP__mavlink_packet(
-                ftp_reply(99, OP_Ack, OP_RemoveFile)
+                ftp_reply(99, OP_Ack, OP_ListDirectory)
             )
             ftp.idle_task()
 
@@ -900,6 +906,13 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         self.assertEqual(result.error_code, FtpError.InvalidDataSize)
         self.assertEqual(result.operation_name, "CalcFileCRC32")
+
+    def test_hardware_crc_report_turns_missing_crc_into_runtime_error(self):
+        """A CRC NACK must report a test failure instead of formatting None."""
+        result = MAVFTPReturn("CalcFileCRC32", FtpError.FileNotFound)
+
+        with self.assertRaises(RuntimeError):
+            _check_crc_result(result, None, 0x12345678)
 
     def test_malformed_ftp_header_returns_invalid_data_size(self):
         """Given a FILE_TRANSFER_PROTOCOL payload shorter than its header, when parsed, then it fails without raising."""
@@ -1092,6 +1105,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
                 self.assertEqual(downloaded.read(), b"data")
             self.assertEqual(os.stat(destination).st_mode & 0o7777, 0o751)
             self.assertEqual(progress, [1.0])
+            self.assertEqual(ftp.get_result, b"data")
             self.assertIsNone(ftp.fh)
             self.assertIsNone(ftp.temp_filename)
             requests = self.sent_requests(master)
@@ -1107,6 +1121,24 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
                 all(request.opcode == OP_TerminateSession for request in transfer_requests[2:])
             )
             self.assertEqual(master.replies, [])
+
+    def test_cmd_get_populates_legacy_get_result(self):
+        """The streamed cmd_get API retains its historical result attribute."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            destination = os.path.join(tempdir, "download.bin")
+            ftp, _master = self.make_ftp(
+                [
+                    ftp_reply(2, OP_Ack, OP_OpenFileRO, payload=struct.pack("<I", 4), session=8),
+                    ftp_reply(3, OP_Ack, OP_BurstReadFile, payload=b"data", burst_complete=1, session=8),
+                    ftp_reply(4, OP_Ack, OP_TerminateSession, session=8),
+                ]
+            )
+
+            ftp.cmd_get(["remote.bin", destination])
+            result = ftp.process_ftp_reply("get", timeout=1)
+
+        self.assertEqual(result.error_code, FtpError.Success)
+        self.assertEqual(ftp.get_result, b"data")
 
     def assert_download_finalization_failure(self, inject_failure):  # pylint: disable=too-many-locals
         """A terminal local-I/O failure must leave no staging file or remote session."""
@@ -1458,14 +1490,14 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(result.system_error, 28)
         self.assertEqual(terminated, [True])
 
-    def test_crc_request_retries_back_off_after_initial_attempts(self):
-        """A silent CRC server must not receive requests at every retry interval."""
+    def test_crc_request_is_not_retried_while_remote_calculates(self):
+        """A lost CRC reply must not start duplicate whole-file calculations."""
         ftp, _master = self.make_ftp([])
         ftp.last_op = FTP_OP(1, 0, OP_CalcFileCRC32, 1, 0, 0, 0, bytearray(b"x"))
         ftp.last_op_reply = False
         ftp.last_op_time = 0
         ftp.last_send_time = 0
-        ftp.request_retries = 11
+        ftp.request_retries = 0
         ftp.ftp_settings.retry_time = 0.5
         send = MagicMock()
         terminate = MagicMock()
@@ -1473,38 +1505,37 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         setattr(ftp, "_MAVFTP__terminate_session", terminate)
 
         with patch("pymavlink.mavftp.time.time", return_value=1.0):
-            self.assertFalse(ftp.idle_task())
-
-        send.assert_not_called()
-        terminate.assert_not_called()
-
-        with patch("pymavlink.mavftp.time.time", return_value=1.1):
-            self.assertFalse(ftp.idle_task())
-
-        send.assert_called_once_with(ftp.last_op, retry=True)
-        terminate.assert_not_called()
-
-    def test_crc_retry_backoff_has_a_bounded_cap(self):
-        """A very old CRC request waits for the maximum backoff interval."""
-        ftp, _master = self.make_ftp([])
-        ftp.last_op = FTP_OP(1, 0, OP_CalcFileCRC32, 1, 0, 0, 0, bytearray(b"x"))
-        ftp.last_op_reply = False
-        ftp.last_op_time = 0
-        ftp.last_send_time = 0
-        ftp.request_retries = 100
-        ftp.ftp_settings.retry_time = 0.5
-        send = MagicMock()
-        setattr(ftp, "_MAVFTP__send", send)
-
+            ftp.idle_task()
         with patch("pymavlink.mavftp.time.time", return_value=31.0):
             ftp.idle_task()
 
         send.assert_not_called()
+        terminate.assert_not_called()
 
-        with patch("pymavlink.mavftp.time.time", return_value=32.1):
-            ftp.idle_task()
+    def test_mutating_initial_requests_are_not_replayed_after_lost_ack(self):
+        """A lost ACK must not repeat a filesystem mutation."""
+        ftp, _master = self.make_ftp([])
+        ftp.ftp_settings.retry_time = 0.5
+        send = MagicMock()
+        terminate = MagicMock()
+        setattr(ftp, "_MAVFTP__send", send)
+        setattr(ftp, "_MAVFTP__terminate_session", terminate)
 
-        send.assert_called_once_with(ftp.last_op, retry=True)
+        for opcode in (OP_CreateFile, OP_RemoveFile, OP_RemoveDirectory, OP_Rename, OP_CreateDirectory):
+            with self.subTest(opcode=opcode):
+                ftp.last_op = FTP_OP(1, 0, opcode, 1, 0, 0, 0, bytearray(b"x"))
+                ftp.last_op_reply = False
+                ftp.last_op_time = 0
+                ftp.last_send_time = 0
+                ftp.request_retries = 0
+                send.reset_mock()
+                terminate.reset_mock()
+
+                with patch("pymavlink.mavftp.time.time", return_value=31.0):
+                    ftp.idle_task()
+
+                send.assert_not_called()
+                terminate.assert_not_called()
 
     def test_staging_file_preserves_existing_private_destination_mode(self):
         """A private destination remains private while its replacement is staged."""
@@ -2308,21 +2339,31 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(result.error_code, FtpError.Fail)
         self.assertEqual(terminated, [True])
 
-    def test_malformed_directory_entry_reports_invalid_data(self):
-        """A malformed file listing entry must not crash reply processing."""
+    def test_malformed_file_entry_does_not_discard_the_listing(self):
+        """A malformed file entry is skipped while valid entries still complete."""
         ftp, _master = self.make_ftp(
             [
                 ftp_reply(
                     2,
                     OP_Ack,
                     OP_ListDirectory,
-                    payload=b"Fmissing-size",
-                )
+                    payload=b"Fmissing-size\x00Fvalid.bin\t3\x00",
+                ),
+                ftp_reply(
+                    3,
+                    OP_Nack,
+                    OP_ListDirectory,
+                    payload=[FtpError.EndOfFile],
+                ),
             ]
         )
         result = ftp.cmd_list([])
 
-        self.assertEqual(result.error_code, FtpError.InvalidDataSize)
+        self.assertEqual(result.error_code, FtpError.Success)
+        self.assertEqual(
+            result.directory_listing,
+            [DirectoryEntry("valid.bin", False, 3)],
+        )
 
     def test_directory_listing_with_time_preserves_metadata(self):
         """The optional listing extension returns file modification times."""
@@ -2461,7 +2502,9 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
                 (OP_ListDirectory, 3, 2, b"/"),
             ],
         )
-        self.assertFalse(ftp.list_time_supported)
+        # A timeout is transport loss, not proof that the server lacks the
+        # extension. Do not permanently downgrade future listings.
+        self.assertIsNone(ftp.list_time_supported)
 
     def test_timestamp_listing_retries_lost_followup_page(self):
         """A lost page request is retried after timestamp support is confirmed."""
@@ -2855,6 +2898,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         ftp._MAVFTP__send_batch(operations)  # pylint: disable=protected-access
 
         self.assertGreater(len(link.writes), 1)
+        self.assertTrue(all(observed is link for observed in ftp.master.mav.observed_files))
         self.assertTrue(all(len(write) <= mavftp_module.MAX_NETWORK_BATCH for write in link.writes))
         encoded = b"".join(link.writes)
         self.assertEqual(len(encoded), 8 * 252)
@@ -2875,6 +2919,17 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
                 for index in range(8)
             ],
         )
+
+    def test_batch_send_without_mavlink_master_falls_back_cleanly(self):
+        """Batching must retain the normal no-master safety guard."""
+        ftp, _master = self.make_ftp([])
+        ftp.master = object()
+        operations = [
+            FTP_OP(ftp.seq, ftp.session, OP_WriteFile, 1, 0, 0, index, bytearray([index]))
+            for index in range(2)
+        ]
+
+        ftp._MAVFTP__send_batch(operations)  # pylint: disable=protected-access
 
     def test_new_features_are_exposed_by_cli(self):
         """The timestamp, CRC, and comparison options are parser-visible."""
@@ -2982,6 +3037,22 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
             ftp._MAVFTP__idle_task()  # pylint: disable=protected-access
 
         self.assertEqual(self.sent_request_sequences(master, OP_OpenFileRO), [1, 1])
+
+    def test_open_retry_keeps_waiting_when_sessions_are_temporarily_full(self):
+        """NoSessionsAvailable must not be converted into a three-second failure."""
+        ftp, master = self.make_ftp([])
+        ftp.cmd_get(["remote", "-"])
+        ftp.op_start = 0
+        ftp.open_retries = 2
+        ftp.session_waiting = True
+        terminated = MagicMock()
+        setattr(ftp, "_MAVFTP__terminate_session", terminated)
+
+        with patch("pymavlink.mavftp.time.time", return_value=1):
+            ftp._MAVFTP__idle_task()  # pylint: disable=protected-access
+
+        self.assertEqual(self.sent_request_sequences(master, OP_OpenFileRO), [1, 1])
+        terminated.assert_not_called()
 
     def test_write_retry_reuses_request_sequence(self):
         """Retransmitting a lost WriteFile reply keeps the original sequence."""

@@ -681,7 +681,12 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         logging.error(usage)
         return MAVFTPReturn("FTP command", FtpError.InvalidArguments)
 
-    def __send(self, op: FTP_OP, retry: bool = False) -> None:  # pylint: disable=too-many-branches
+    def __send(
+        self,
+        op: FTP_OP,
+        retry: bool = False,
+        writer: Optional[Any] = None,
+    ) -> None:  # pylint: disable=too-many-branches
         """Send a request, preserving its sequence number on retransmission."""
         if not retry:
             op.seq = self.seq
@@ -700,7 +705,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         else:
             lag = self.__packet_delay("TX")
             if lag == 0:
-                self.__transmit_payload(payload)
+                self.__transmit_payload(payload, writer)
             else:
                 self.delay_sequence += 1
                 deadline = max(time.monotonic() + lag, self.last_tx_deadline)
@@ -735,9 +740,34 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         self.last_op_time = time.time()
         self.last_send_time = now
 
-    def __transmit_payload(self, payload: bytes) -> None:
+    def __transmit_payload(self, payload: bytes, writer: Optional[Any] = None) -> None:
         """Transmit an already encoded MAVLink FTP payload."""
         if self.master is None or not hasattr(self.master, "mav"):
+            return
+        if writer is not None:
+            mav = self.master.mav
+            message = mav.file_transfer_protocol_encode(
+                self.network, self.target_system, self.target_component, payload
+            )
+            packet = message.pack(mav) if hasattr(message, "pack") else bytes(message)
+            writer.write(packet)
+            if hasattr(mav, "seq"):
+                mav.seq = (mav.seq + 1) % 256
+            if hasattr(mav, "total_packets_sent"):
+                mav.total_packets_sent += 1
+            if hasattr(mav, "total_bytes_sent"):
+                mav.total_bytes_sent += len(packet)
+            send_callback = getattr(mav, "send_callback", None)
+            if (
+                send_callback is not None
+                and getattr(mav, "send_callback_args", None) is not None
+                and getattr(mav, "send_callback_kwargs", None) is not None
+            ):
+                send_callback(
+                    message,
+                    *mav.send_callback_args,
+                    **mav.send_callback_kwargs,
+                )
             return
         self.master.mav.file_transfer_protocol_send(
             self.network, self.target_system, self.target_component, payload
@@ -889,20 +919,21 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
 
     def __send_batch(self, operations: List[FTP_OP]) -> None:
         """Send several requests in one underlying link write when possible."""
-        if len(operations) <= 1 or not hasattr(self.master.mav, "file"):
+        if (
+            len(operations) <= 1
+            or self.master is None
+            or not hasattr(self.master, "mav")
+            or not hasattr(self.master.mav, "file")
+            or not hasattr(self.master.mav, "file_transfer_protocol_encode")
+        ):
             for operation in operations:
                 self.__send(operation)
             return
 
-        mav = self.master.mav
-        link = mav.file
+        link = self.master.mav.file
         collector = MAVLinkBatchWriter()
-        mav.file = collector
-        try:
-            for operation in operations:
-                self.__send(operation)
-        finally:
-            mav.file = link
+        for operation in operations:
+            self.__send(operation, writer=collector)
 
         if not collector.packets:
             return
@@ -1182,10 +1213,11 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             )
         return self.process_ftp_reply("ListDirectory", timeout=timeout)
 
-    def __list_without_time(self) -> None:
+    def __list_without_time(self, mark_unsupported: bool = True) -> None:
         """Restart a timestamp listing with the baseline directory opcode."""
         self.list_with_time = False
-        self.list_time_supported = False
+        if mark_unsupported:
+            self.list_time_supported = False
         self.list_time_retries = 0
         self.dir_offset = 0
         self.total_size = 0
@@ -1246,11 +1278,11 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                         fields = dir_entry[1:].rsplit("\t", 2 if with_time else 1)
                     except ValueError:
                         logging.error("Invalid file entry: %s", dir_entry)
-                        return MAVFTPReturn("ListDirectory", FtpError.InvalidDataSize)
+                        continue
                     expected_fields = 3 if with_time else 2
                     if len(fields) != expected_fields:
                         logging.error("Invalid file entry: %s", dir_entry)
-                        return MAVFTPReturn("ListDirectory", FtpError.InvalidDataSize)
+                        continue
                     if with_time:
                         name, size_str, mtime_str = fields
                         try:
@@ -1650,12 +1682,19 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                     result = self.fh.read()
                     actual_size = len(result)
                 elif self.temp_filename is not None:
+                    # ``cmd_get`` historically exposed the completed bytes
+                    # through ``get_result``. Keep that public API while the
+                    # transfer itself still uses a staging file.
                     actual_size = os.fstat(self.fh.fileno()).st_size
+                    self.fh.seek(0)
+                    result = self.fh.read()
                 else:
                     result = b""
                 if self.read_to_memory:
                     self.get_result = result[: self.requested_size]
-                elif not self.remote_size_known:
+                elif self.filename in ("-",) or self.temp_filename is not None:
+                    self.get_result = result
+                if not self.read_to_memory and not self.remote_size_known:
                     self.requested_size = max(0, actual_size - self.requested_offset)
                 if self.read_to_memory and len(self.get_result) < self.requested_size:
                     logging.warning(
@@ -3044,7 +3083,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             ):
                 if self.ftp_settings.debug > 0:
                     logging.info("FTP: listing timestamps unsupported, retrying without")
-                self.__list_without_time()
+                self.__list_without_time(mark_unsupported=False)
             else:
                 self.list_time_retries += 1
                 if self.ftp_settings.debug > 0:
@@ -3067,7 +3106,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         ):
             self.op_start = now
             self.open_retries += 1
-            if self.open_retries > 2:
+            if self.open_retries > 2 and not self.session_waiting:
                 # fail the get
                 self.op_start = None
                 self.__terminate_session()
@@ -3076,25 +3115,13 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 logging.info("FTP: retry open")
             self.__send(self.last_op, retry=True)
 
-        # Initial requests for the one-reply operations are idempotent. Retry
-        # them with the original sequence number so a dropped request or ACK
-        # can be recovered without creating a second operation on the server.
+        # Directory reads are safe to replay. Mutating operations must not be
+        # retried after a lost ACK: the server may already have applied them.
         initial_opcodes = {
             OP_ListDirectory,
             OP_ListDirectoryWithTime,
-            OP_CreateFile,
-            OP_RemoveFile,
-            OP_RemoveDirectory,
-            OP_Rename,
-            OP_CreateDirectory,
-            OP_CalcFileCRC32,
         }
         retry_timeout = self.retry_timeout()
-        if self.last_op is not None and self.last_op.opcode == OP_CalcFileCRC32:
-            # CRC requests can take longer than the normal retry budget, but
-            # continuously queueing duplicate full-file CRCs can starve the
-            # server's FTP worker.  Retain early loss recovery, then back off.
-            retry_timeout *= 2 ** min(max(self.request_retries - 10, 0), 6)
         if (
             self.last_op is not None
             and not self.last_op_reply
@@ -3106,7 +3133,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             )
             and now - self.last_op_time > retry_timeout
         ):
-            if self.request_retries >= 10 and self.last_op.opcode != OP_CalcFileCRC32:
+            if self.request_retries >= 10:
                 logging.error("FTP: request timed out: %s", self.last_op)
                 self.__terminate_session()
                 return False
@@ -3115,8 +3142,9 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             self.__send(self.last_op, retry=True)
             return False
 
-        # A CRC calculation may still be running remotely while retry
-        # backoff is in effect.  Its caller owns the overall deadline.
+        # CRC requests can take longer than the normal idle window. Do not
+        # retransmit them, but keep the caller's overall timeout in control of
+        # how long the remote calculation may run.
         if (
             self.last_op is not None
             and self.last_op.opcode == OP_CalcFileCRC32
