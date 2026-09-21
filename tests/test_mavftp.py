@@ -1605,6 +1605,37 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         terminate.assert_called_once()
 
+    def test_initial_retry_backoff_cap_precedes_idle_detection(self):
+        """The final initial-request retry deadline must beat idle detection."""
+        ftp, _master = self.make_ftp([])
+        ftp.last_op = FTP_OP(1, 0, OP_RemoveFile, 1, 0, 0, 0, bytearray(b"x"))
+        ftp.last_op_reply = False
+        ftp.request_retries = MAX_INITIAL_RETRIES
+        ftp.last_op_time = 0.0
+        ftp.last_send_time = 0.0
+        ftp.ftp_settings.retry_time = 0.2
+        terminate = MagicMock()
+        setattr(ftp, "_MAVFTP__terminate_session", terminate)
+
+        with patch("pymavlink.mavftp.time.time", return_value=1.01):
+            self.assertFalse(ftp.idle_task())
+
+        terminate.assert_called_once()
+
+    def test_silent_initial_request_reports_remote_reply_timeout(self):
+        """An unanswered initial request is classified as a remote timeout."""
+        ftp, _master = self.make_ftp([])
+        clock = [0.0]
+
+        def fake_time():
+            clock[0] += 0.05
+            return clock[0]
+
+        with patch("pymavlink.mavftp.time.time", side_effect=fake_time):
+            result = ftp.cmd_rm(["remote"])
+
+        self.assertEqual(result.error_code, FtpError.RemoteReplyTimeout)
+
     def test_staging_file_preserves_existing_private_destination_mode(self):
         """A private destination remains private while its replacement is staged."""
         previous_umask = os.umask(0o022)
@@ -2574,6 +2605,25 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         # extension. Do not permanently downgrade future listings.
         self.assertIsNone(ftp.list_time_supported)
 
+    def test_slow_timestamp_probes_reach_baseline_before_cmd_list_timeout(self):
+        """The list deadline covers RTT-scaled timestamp probes and fallback."""
+        ftp, _master = self.make_ftp([], list_time=1)
+        ftp.ftp_settings.list_time_timeout = 3.0
+        ftp.ftp_settings.list_retries = 3
+        ftp.ftp_settings.retry_time = 0.5
+        ftp.rtt = 2.0
+        ftp.rttvar = 0.5
+        ftp.rtt_valid = True
+        process_reply = MagicMock(
+            return_value=MAVFTPReturn("ListDirectory", FtpError.Success)
+        )
+        ftp.process_ftp_reply = process_reply
+
+        result = ftp.cmd_list([])
+
+        self.assertEqual(result.error_code, FtpError.Success)
+        process_reply.assert_called_once_with("ListDirectory", timeout=16.02)
+
     def test_timestamp_listing_retries_lost_followup_page(self):
         """A lost page request is retried after timestamp support is confirmed."""
         master = LostTimestampPageMaster()
@@ -3156,6 +3206,28 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         self.assertEqual(result.error_code, FtpError.NoSessionsAvailable)
         self.assertNotIn("session_waiting", ftp.__dict__)
+
+    def test_open_no_sessions_reply_does_not_mutate_unused_reply_state(self):
+        """The open-session retry path does not write an unconsumed flag."""
+        ftp, _master = self.make_ftp([])
+        ftp.last_op_reply = True
+
+        result = ftp._MAVFTP__handle_open_ro_reply(  # pylint: disable=protected-access
+            FTP_OP(
+                2,
+                0,
+                OP_Nack,
+                1,
+                OP_OpenFileRO,
+                0,
+                0,
+                bytearray([FtpError.NoSessionsAvailable]),
+            ),
+            None,
+        )
+
+        self.assertEqual(result.error_code, FtpError.NoSessionsAvailable)
+        self.assertTrue(ftp.last_op_reply)
 
     def test_open_retry_waits_for_sessions_but_still_has_a_hard_cap(self):
         """NoSessionsAvailable extends, but never removes, the open retry budget."""
@@ -4263,6 +4335,39 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         terminate.assert_called_once()
         self.assertEqual(ftp.read_retries, MAX_READ_RETRIES)
 
+    def test_burst_retry_exhaustion_reports_timeout_after_termination_cleanup(self):
+        """A capped burst download must not return the earlier open success."""
+        ftp, _master = self.make_ftp([])
+        ftp.fh = BytesIO()
+        ftp.filename = "remote.bin"
+        ftp.last_op = FTP_OP(
+            0,
+            ftp.session,
+            OP_BurstReadFile,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        ftp.last_burst_read = 0.0
+        ftp.read_retries = MAX_READ_RETRIES
+        ftp.read_complete = False
+        ftp.last_send_time = 0.0
+        ftp.op_start = None
+
+        def terminate_session():
+            ftp.last_burst_read = None
+            ftp.fh = None
+
+        with (
+            patch.object(ftp, "_MAVFTP__terminate_session", side_effect=terminate_session),
+            patch("pymavlink.mavftp.time.time", return_value=1.0),
+        ):
+            result = ftp.process_ftp_reply("get", timeout=1)
+
+        self.assertEqual(result.error_code, FtpError.RemoteReplyTimeout)
+
     def test_burst_progress_resets_the_consecutive_stall_retry_cap(self):
         """A payload accepted between stalls starts a fresh retry window."""
         ftp, _master = self.make_ftp([])
@@ -4463,7 +4568,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         result = ftp.cmd_rm(["remote"])
 
-        self.assertEqual(result.error_code, FtpError.Fail)
+        self.assertEqual(result.error_code, FtpError.RemoteReplyTimeout)
 
     def test_completed_put_skips_late_reply_after_termination_timeout(self):
         ftp, master = self.make_ftp(

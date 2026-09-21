@@ -557,6 +557,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         # distinguishing an already-open session from an initial failure.
         self.request_retries = 0
         self.last_op_reply = False
+        self.terminal_timeout = False
         # sequence numbers of in-flight terminate/reset requests, None
         # when nothing is outstanding: replies are correlated by
         # sequence so a stale or duplicated reply from an earlier
@@ -1207,9 +1208,10 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 getattr(self.ftp_settings, "list_time_timeout", 3.0)
             )
             list_retries = int(getattr(self.ftp_settings, "list_retries", 3))
+            list_probe_timeout = max(self.retry_timeout(), list_time_timeout)
             timeout = max(
                 timeout,
-                list_time_timeout * (list_retries + 1)
+                list_probe_timeout * (list_retries + 1)
                 + float(self.ftp_settings.idle_detection_time),
             )
         return self.process_ftp_reply("ListDirectory", timeout=timeout)
@@ -1606,7 +1608,6 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         ):
             # Keep the operation alive while the server's session table is
             # temporarily full. __idle_task will retry the same request.
-            self.last_op_reply = False
             return MAVFTPReturn("OpenFileRO", FtpError.NoSessionsAvailable)
         ret = self.__decode_ftp_ack_and_nack(op)
         if self.callback is None or self.ftp_settings.debug > 0:
@@ -3107,6 +3108,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             if self.open_retries > MAX_READ_RETRIES:
                 # fail the get
                 self.op_start = None
+                self.terminal_timeout = True
                 self.__terminate_session()
                 return False  # Not idle yet
             if self.ftp_settings.debug > 0:
@@ -3147,6 +3149,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         ):
             if self.request_retries >= MAX_INITIAL_RETRIES:
                 logging.error("FTP: request timed out: %s", self.last_op)
+                self.terminal_timeout = True
                 self.__terminate_session()
                 return False
             if self.ftp_settings.debug > 0:
@@ -3182,6 +3185,10 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 logging.error(
                     "FTP: burst read timed out after %u retries", self.read_retries
                 )
+                # __terminate_session clears last_burst_read. Preserve the
+                # terminal result so process_ftp_reply cannot retain the
+                # earlier OpenFileRO success.
+                self.terminal_timeout = True
                 self.__terminate_session()
                 return False
             dt = now - self.last_burst_read
@@ -3232,6 +3239,8 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         """Execute an FTP operation that requires processing a MAVLink response."""
         start_time = time.time()
         ret = MAVFTPReturn(operation_name, FtpError.Fail)
+        if operation_name != "TerminateSession":
+            self.terminal_timeout = False
         if self.master is None:
             logging.error("FTP: Can't receive reply, no master")
             return MAVFTPReturn(operation_name, FtpError.RemoteReplyTimeout)
@@ -3422,6 +3431,13 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                     self.callback_failure = None
                     break
                 if malformed_result:
+                    break
+                if (
+                    operation_name != "TerminateSession"
+                    and self.terminal_timeout
+                ):
+                    ret = MAVFTPReturn(operation_name, FtpError.RemoteReplyTimeout)
+                    self.terminal_timeout = False
                     break
                 if idle_expired and not delayed_reply_accepted:
                     if self.last_burst_read is not None and not self.read_complete:
