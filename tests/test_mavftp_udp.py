@@ -28,6 +28,7 @@ from pymavlink import mavutil
 from pymavlink.mavftp import (
     DirectoryEntry,
     FTP_OP,
+    MAX_INITIAL_RETRIES,
     MAVFTP,
     FtpError,
     OP_Ack,
@@ -364,10 +365,10 @@ class TestMAVFTPUDP(unittest.TestCase):
             for request in self.responder.requests
             if request.opcode == OP_RemoveFile
         ]
-        self.assertGreaterEqual(len(remove_requests), 1)
+        self.assertEqual(len(remove_requests), MAX_INITIAL_RETRIES + 1)
         self.assertEqual(
             [request.seq for request in remove_requests],
-            [remove_requests[0].seq] * len(remove_requests),
+            [remove_requests[0].seq] * (MAX_INITIAL_RETRIES + 1),
         )
 
     def test_real_udp_download_round_trip_uses_remote_session(self):
