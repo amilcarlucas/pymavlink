@@ -1552,7 +1552,6 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
             OP_RemoveDirectory,
             OP_Rename,
             OP_CreateDirectory,
-            OP_CalcFileCRC32,
         ):
             with self.subTest(opcode=opcode):
                 ftp.last_op = FTP_OP(1, 0, opcode, 1, 0, 0, 0, bytearray(b"x"))
@@ -2891,6 +2890,63 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(result.error_code, FtpError.Success)
         self.assertTrue(ftp.rtt_valid)
         self.assertGreater(ftp.retry_timeout(), baseline_timeout)
+
+    def test_crc_waits_for_a_long_remote_calculation_without_retrying(self):
+        """A CRC request may outlive idle detection but is sent only once."""
+        ftp, master = self.make_ftp([])
+        master.replies.append(
+            ftp_reply(
+                2,
+                OP_Ack,
+                OP_CalcFileCRC32,
+                payload=struct.pack("<I", 0x12345678),
+            )
+        )
+        master.empty_polls = 5
+        clock = [0.0]
+
+        def fake_time():
+            clock[0] += 0.05
+            return clock[0]
+
+        with patch("pymavlink.mavftp.time.time", side_effect=fake_time):
+            result = ftp.cmd_crc(["remote"], timeout=1.0)
+
+        self.assertEqual(result.error_code, FtpError.Success)
+        self.assertEqual(
+            len(
+                [
+                    sent
+                    for sent in master.mav.sent
+                    if sent[-1][3] == OP_CalcFileCRC32
+                ]
+            ),
+            1,
+        )
+
+    def test_crc_uses_caller_timeout_when_remote_calculation_never_replies(self):
+        """A silent CRC request times out at its caller deadline, not idle time."""
+        ftp, master = self.make_ftp([])
+        clock = [0.0]
+
+        def fake_time():
+            clock[0] += 0.05
+            return clock[0]
+
+        with patch("pymavlink.mavftp.time.time", side_effect=fake_time):
+            result = ftp.cmd_crc(["remote"], timeout=1.0)
+
+        self.assertEqual(result.error_code, FtpError.RemoteReplyTimeout)
+        self.assertEqual(
+            len(
+                [
+                    sent
+                    for sent in master.mav.sent
+                    if sent[-1][3] == OP_CalcFileCRC32
+                ]
+            ),
+            1,
+        )
 
     def test_terminate_uses_rtt_timeout_with_one_second_cap(self):
         """Session termination uses the adaptive timeout but remains bounded."""

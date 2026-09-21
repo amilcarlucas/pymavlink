@@ -3143,8 +3143,12 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 and self.list_time_supported is not True
             )
         )
+        crc_request_pending = (
+            initial_request_pending and self.last_op.opcode == OP_CalcFileCRC32
+        )
         if (
             initial_request_pending
+            and not crc_request_pending
             and now - self.last_op_time > retry_timeout
         ):
             if self.request_retries >= MAX_INITIAL_RETRIES:
@@ -3158,11 +3162,12 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             return False
 
         # A request waiting for its next exponential retry must not be
-        # mistaken for an otherwise idle transfer.  In particular, this lets
+        # mistaken for an otherwise idle transfer. In particular, this lets
         # the final retry in MAX_INITIAL_RETRIES become due.
-        # CalcFileCRC32 keeps its existing idle behavior while its retry and
-        # caller-timeout policy is awaiting a maintainer decision.
-        if initial_request_pending and self.last_op.opcode != OP_CalcFileCRC32:
+        # CRC32 is different: the remote calculation may be long-running, and
+        # retrying could start duplicate work. Let process_ftp_reply's caller
+        # timeout govern it without retransmitting or applying idle detection.
+        if initial_request_pending:
             return False
 
         if (
