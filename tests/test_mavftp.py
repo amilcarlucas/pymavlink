@@ -29,6 +29,7 @@ from pymavlink.mavftp import (
     FTP_OP,
     FTP_SEQ_MODULUS,
     FTP_SESSION_MODULUS,
+    MAX_INITIAL_RETRIES,
     MAX_READ_GAPS,
     MAX_READ_RETRIES,
     MAVFTP,
@@ -1574,6 +1575,36 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
                 terminate.assert_called_once()
 
+    def test_initial_request_retries_use_the_full_budget_before_idle_timeout(self):
+        """A silent initial request gets every configured retransmission."""
+        ftp, _master = self.make_ftp([])
+        ftp.last_op = FTP_OP(1, 0, OP_RemoveFile, 1, 0, 0, 0, bytearray(b"x"))
+        ftp.last_op_reply = False
+        ftp.last_op_time = 0.0
+        ftp.last_send_time = 0.0
+        terminate = MagicMock()
+        setattr(ftp, "_MAVFTP__terminate_session", terminate)
+
+        for now in (1.01, 3.02):
+            with self.subTest(now=now), patch(
+                "pymavlink.mavftp.time.time", return_value=now
+            ):
+                ftp.idle_task()
+
+        with patch("pymavlink.mavftp.time.time", return_value=3.05):
+            self.assertFalse(ftp.idle_task())
+
+        with patch("pymavlink.mavftp.time.time", return_value=7.03):
+            ftp.idle_task()
+
+        self.assertEqual(ftp.request_retries, MAX_INITIAL_RETRIES)
+        terminate.assert_not_called()
+
+        with patch("pymavlink.mavftp.time.time", return_value=11.04):
+            ftp.idle_task()
+
+        terminate.assert_called_once()
+
     def test_staging_file_preserves_existing_private_destination_mode(self):
         """A private destination remains private while its replacement is staged."""
         previous_umask = os.umask(0o022)
@@ -3026,6 +3057,17 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertIsNone(args.local_file)
         self.assertIsNone(args.remote_file)
 
+    def test_example_main_reports_missing_paths_as_an_argument_error(self):
+        """The command-line entry point keeps argparse's usage diagnostics."""
+        stderr = StringIO()
+
+        with patch.object(sys, "stderr", stderr), self.assertRaises(SystemExit) as error:
+            mavftp_example.main([])
+
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("usage:", stderr.getvalue())
+        self.assertIn("LOCAL_FILE and REMOTE_FILE are required", stderr.getvalue())
+
     def test_write_nack_preserves_server_error(self):
         """WriteFile NACKs retain their precise protocol error code."""
         ftp, _master = self.make_ftp([])
@@ -3098,11 +3140,27 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         self.assertEqual(self.sent_request_sequences(master, OP_OpenFileRO), [1, 1])
 
+    def test_no_sessions_available_does_not_leave_unused_session_state(self):
+        """NoSessionsAvailable uses the retry timer without a shadow flag."""
+        ftp, _master = self.make_ftp([])
+        ftp.cmd_get(["remote", "-"])
+
+        result = ftp._MAVFTP__mavlink_packet(  # pylint: disable=protected-access
+            ftp_reply(
+                2,
+                OP_Nack,
+                OP_OpenFileRO,
+                payload=[FtpError.NoSessionsAvailable],
+            )
+        )
+
+        self.assertEqual(result.error_code, FtpError.NoSessionsAvailable)
+        self.assertNotIn("session_waiting", ftp.__dict__)
+
     def test_open_retry_waits_for_sessions_but_still_has_a_hard_cap(self):
         """NoSessionsAvailable extends, but never removes, the open retry budget."""
         ftp, master = self.make_ftp([])
         ftp.cmd_get(["remote", "-"])
-        ftp.session_waiting = True
         terminated = MagicMock()
         setattr(ftp, "_MAVFTP__terminate_session", terminated)
 
@@ -3111,7 +3169,6 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
             with patch("pymavlink.mavftp.time.time", return_value=1):
                 ftp._MAVFTP__idle_task()  # pylint: disable=protected-access
 
-        self.assertFalse(ftp.session_waiting)
         terminated.assert_not_called()
 
         ftp.op_start = 0

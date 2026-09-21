@@ -557,7 +557,6 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         # distinguishing an already-open session from an initial failure.
         self.request_retries = 0
         self.last_op_reply = False
-        self.session_waiting = False
         # sequence numbers of in-flight terminate/reset requests, None
         # when nothing is outstanding: replies are correlated by
         # sequence so a stale or duplicated reply from an earlier
@@ -692,12 +691,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         if not retry:
             op.seq = self.seq
             self.request_retries = 0
-            self.session_waiting = False
             self.last_op_reply = False
-        else:
-            # A NoSessionsAvailable NACK delays the next retry, but must not
-            # suppress the retry budget once that retry has been sent.
-            self.session_waiting = False
         payload = op.pack()
         plen = len(payload)
         if plen < MAX_Payload + HDR_Len:
@@ -1066,7 +1060,6 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         self.read_to_memory = False
         self.remote_size_known = False
         self.transfer_active = False
-        self.session_waiting = False
         self.write_list = None
         self.write_open = False
         self.show_progress = False
@@ -1509,7 +1502,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         self.__send(op)
         return MAVFTPReturn("OpenFileRO", FtpError.Success)
 
-    def __handle_open_ro_reply(  # pylint: disable=too-many-branches,too-many-return-statements, too-many-statements
+    def __handle_open_ro_reply(  # pylint: disable=too-many-branches,too-many-return-statements
         self, op: FTP_OP, _m
     ) -> MAVFTPReturn:
         """Handle OP_OpenFileRO reply."""
@@ -1592,7 +1585,6 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             and op.payload[0] == FtpError.Fail
         )
         if recovered_open:
-            self.session_waiting = False
             return self.__handle_open_ro_reply(
                 FTP_OP(
                     op.seq,
@@ -1614,7 +1606,6 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         ):
             # Keep the operation alive while the server's session table is
             # temporarily full. __idle_task will retry the same request.
-            self.session_waiting = True
             self.last_op_reply = False
             return MAVFTPReturn("OpenFileRO", FtpError.NoSessionsAvailable)
         ret = self.__decode_ftp_ack_and_nack(op)
@@ -2952,7 +2943,6 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 # Keep the current operation intact and let idle processing retry
                 # it instead of failing a callback or tearing down a valid local
                 # upload/download setup.
-                self.session_waiting = True
                 self.last_op_reply = False
                 self.last_op_time = now
                 return self.__decode_ftp_ack_and_nack(op)
@@ -3141,7 +3131,7 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         retry_timeout = self.retry_timeout() * 2 ** min(
             self.request_retries, MAX_INITIAL_RETRIES - 1
         )
-        if (
+        initial_request_pending = (
             self.last_op is not None
             and not self.last_op_reply
             and self.last_op.opcode in initial_opcodes
@@ -3150,6 +3140,9 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 and self.dir_offset == 0
                 and self.list_time_supported is not True
             )
+        )
+        if (
+            initial_request_pending
             and now - self.last_op_time > retry_timeout
         ):
             if self.request_retries >= MAX_INITIAL_RETRIES:
@@ -3159,6 +3152,14 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             if self.ftp_settings.debug > 0:
                 logging.info("FTP: retry request %s", self.last_op)
             self.__send(self.last_op, retry=True)
+            return False
+
+        # A request waiting for its next exponential retry must not be
+        # mistaken for an otherwise idle transfer.  In particular, this lets
+        # the final retry in MAX_INITIAL_RETRIES become due.
+        # CalcFileCRC32 keeps its existing idle behavior while its retry and
+        # caller-timeout policy is awaiting a maintainer decision.
+        if initial_request_pending and self.last_op.opcode != OP_CalcFileCRC32:
             return False
 
         if (
