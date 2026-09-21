@@ -928,6 +928,17 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(result.error_code, FtpError.InvalidDataSize)
         self.assertEqual(result.operation_name, "CalcFileCRC32")
 
+    def test_crc_zero_timeout_uses_the_bounded_default(self):
+        """An explicit zero timeout must not disable CRC's only deadline."""
+        ftp, _master = self.make_ftp([])
+        ftp.process_ftp_reply = MagicMock(
+            return_value=MAVFTPReturn("CalcFileCRC32", FtpError.RemoteReplyTimeout)
+        )
+
+        ftp.cmd_crc(["remote.bin"], timeout=0)
+
+        ftp.process_ftp_reply.assert_called_once_with("CalcFileCRC32", timeout=5.0)
+
     def test_hardware_crc_report_turns_missing_crc_into_runtime_error(self):
         """A CRC NACK must report a test failure instead of formatting None."""
         result = MAVFTPReturn("CalcFileCRC32", FtpError.FileNotFound)
@@ -1786,6 +1797,31 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
             self.assertEqual(result.error_code, FtpError.Fail)
             self.assertEqual(ftp.crccmp_results, ["ERROR", "SKIPPED"])
             ftp.cmd_crc.assert_not_called()
+
+    def test_crccmp_shares_its_deadline_between_remaining_files(self):
+        """One silent CRC must not consume the whole comparison budget."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            for filename in ("a.bin", "b.bin", "c.bin"):
+                with open(os.path.join(tempdir, filename), "wb") as output:
+                    output.write(b"data")
+            ftp, _master = self.make_ftp([])
+            ftp.ftp_settings.crccmp_timeout = 30.0
+            ftp.local_file_crc = MagicMock(return_value=1)
+            now = [0.0]
+            attempted = []
+
+            def silent_crc(args, timeout=None):
+                attempted.append(args[0])
+                now[0] += timeout
+                return MAVFTPReturn("CalcFileCRC32", FtpError.RemoteReplyTimeout)
+
+            ftp.cmd_crc = MagicMock(side_effect=silent_crc)
+            with patch("pymavlink.mavftp.time.time", side_effect=lambda: now[0]):
+                result = ftp.cmd_crccmp([os.path.join(tempdir, "*.bin"), "/remote"])
+
+        self.assertEqual(result.error_code, FtpError.Fail)
+        self.assertEqual(attempted, ["/remote/a.bin", "/remote/b.bin", "/remote/c.bin"])
+        self.assertEqual(ftp.crccmp_results, ["ERROR", "ERROR", "ERROR"])
 
     def test_crccmp_records_files_skipped_after_deadline(self):
         """A deadline-expired batch includes an explicit result for every file."""
@@ -3038,6 +3074,28 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(master.replies, [])
         self.assertEqual(self.sent_requests(master)[-1].opcode, OP_RemoveFile)
 
+    def test_delayed_reply_wins_over_a_simultaneous_terminal_timeout(self):
+        """A reply released from RX delay cannot be overwritten by a timeout."""
+        ftp, _master = self.make_ftp([])
+        ftp.cmd_rm(["remote"])
+
+        idle_calls = [0]
+
+        def queue_delayed_reply():
+            idle_calls[0] += 1
+            if idle_calls[0] == 1:
+                ftp.terminal_timeout = True
+                ftp.delayed_rx_results.append(
+                    (MAVFTPReturn("RemoveFile", FtpError.Success), True, True, False, True)
+                )
+                return False
+            return True
+
+        ftp.idle_task = queue_delayed_reply
+        result = ftp.process_ftp_reply("RemoveFile", timeout=1)
+
+        self.assertEqual(result.error_code, FtpError.Success)
+
     def test_loss_seed_replays_jitter_sequence(self):
         """The loss seed makes latency jitter reproducible between clients."""
         first, _master = self.make_ftp([])
@@ -3597,6 +3655,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         with patch.object(sys, "stdout", stdout):
             self.assertTrue(ftp._MAVFTP__check_read_finished())
         self.assertEqual(stdout.buffer.getvalue(), b"x" * 200)
+        self.assertEqual(ftp.get_result, b"x" * 200)
 
     def test_stdout_download_falls_back_to_text_stdout(self):
         """A StringIO stdout accepts a completed '-' download."""
@@ -3613,6 +3672,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         with patch.object(sys, "stdout", stdout):
             self.assertTrue(ftp._MAVFTP__check_read_finished())
         self.assertEqual(stdout.getvalue(), "text output")
+        self.assertEqual(ftp.get_result, b"text output")
 
     def test_stdout_download_callback_owns_data(self):
         """A callback suppresses stdout publication for a '-' download."""

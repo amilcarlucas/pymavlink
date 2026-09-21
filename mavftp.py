@@ -2581,8 +2581,19 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
             bytearray(enc_name),
         )
         self.__send(op)
+        # ``process_ftp_reply`` treats zero as an unbounded caller timeout.
+        # CRC requests deliberately suppress idle detection, so preserve the
+        # command's bounded default for an explicit zero too.
         if timeout is None:
             timeout = 5.0
+        else:
+            try:
+                if float(timeout) <= 0:
+                    timeout = 5.0
+            except (TypeError, ValueError):
+                # Leave malformed values to process_ftp_reply(), which returns
+                # InvalidArguments consistently for all command paths.
+                pass
         return self.process_ftp_reply("CalcFileCRC32", timeout=timeout)
 
     @staticmethod
@@ -2689,7 +2700,11 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                     )
                     self.crccmp_results.append("SKIPPED")
                 break
-            result = self.cmd_crc([remote_name], timeout=remaining)
+            # Give every remaining file a chance within the batch deadline.
+            # A silent vehicle must not spend the entire budget on the first
+            # CRC request and leave the rest untested.
+            crc_timeout = remaining / (len(files) - file_index)
+            result = self.cmd_crc([remote_name], timeout=crc_timeout)
             if result.error_code == FtpError.Success and self.last_crc is not None:
                 if self.last_crc == local_crc:
                     logging.info("  MATCH   %s 0x%08x", basename, local_crc)
@@ -3440,10 +3455,13 @@ class MAVFTP:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                 if (
                     operation_name != "TerminateSession"
                     and self.terminal_timeout
+                    and not delayed_reply_accepted
                 ):
                     ret = MAVFTPReturn(operation_name, FtpError.RemoteReplyTimeout)
                     self.terminal_timeout = False
                     break
+                if delayed_reply_accepted:
+                    self.terminal_timeout = False
                 if idle_expired and not delayed_reply_accepted:
                     if self.last_burst_read is not None and not self.read_complete:
                         ret = MAVFTPReturn(operation_name, FtpError.RemoteReplyTimeout)
