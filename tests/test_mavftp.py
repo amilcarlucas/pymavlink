@@ -1646,6 +1646,38 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         self.assertEqual(result.error_code, FtpError.RemoteReplyTimeout)
 
+    def test_initial_retry_ladder_fits_the_default_caller_timeout(self):
+        """A high RTT still permits every initial retry before the 5s deadline."""
+        ftp, master = self.make_ftp([])
+        ftp.rtt_valid = True
+        ftp.rtt = 0.3
+        ftp.rttvar = 0.15
+        clock = [0.0]
+
+        def fake_time():
+            clock[0] += 0.05
+            return clock[0]
+
+        with patch("pymavlink.mavftp.time.time", side_effect=fake_time):
+            result = ftp.cmd_rm(["remote"])
+
+        remove_requests = [
+            sent for sent in master.mav.sent if sent[-1][3] == OP_RemoveFile
+        ]
+        self.assertEqual(result.error_code, FtpError.RemoteReplyTimeout)
+        self.assertEqual(len(remove_requests), MAX_INITIAL_RETRIES + 1)
+
+    def test_crc_rejects_negative_and_nonfinite_timeouts_without_sending(self):
+        """CRC's bounded zero default does not turn invalid values into waits."""
+        for timeout in (-1, float("-inf")):
+            with self.subTest(timeout=timeout):
+                ftp, master = self.make_ftp([])
+
+                result = ftp.cmd_crc(["remote"], timeout=timeout)
+
+                self.assertEqual(result.error_code, FtpError.InvalidArguments)
+                self.assertEqual(len(master.mav.sent), 1)  # ResetSessions only.
+
     def test_staging_file_preserves_existing_private_destination_mode(self):
         """A private destination remains private while its replacement is staged."""
         previous_umask = os.umask(0o022)
@@ -1798,8 +1830,8 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
             self.assertEqual(ftp.crccmp_results, ["ERROR", "SKIPPED"])
             ftp.cmd_crc.assert_not_called()
 
-    def test_crccmp_shares_its_deadline_between_remaining_files(self):
-        """One silent CRC must not consume the whole comparison budget."""
+    def test_crccmp_spends_its_remaining_deadline_on_a_silent_crc(self):
+        """A silent CRC exhausts the shared deadline before later files run."""
         with tempfile.TemporaryDirectory() as tempdir:
             for filename in ("a.bin", "b.bin", "c.bin"):
                 with open(os.path.join(tempdir, filename), "wb") as output:
@@ -1820,8 +1852,35 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
                 result = ftp.cmd_crccmp([os.path.join(tempdir, "*.bin"), "/remote"])
 
         self.assertEqual(result.error_code, FtpError.Fail)
-        self.assertEqual(attempted, ["/remote/a.bin", "/remote/b.bin", "/remote/c.bin"])
-        self.assertEqual(ftp.crccmp_results, ["ERROR", "ERROR", "ERROR"])
+        self.assertEqual(attempted, ["/remote/a.bin"])
+        self.assertEqual(ftp.crccmp_results, ["ERROR", "ERROR", "SKIPPED"])
+
+    def test_crccmp_keeps_slow_responsive_crc_results_before_deadline(self):
+        """Slow responsive CRCs are not capped below their actual duration."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            for index in range(10):
+                with open(os.path.join(tempdir, f"{index}.bin"), "wb") as output:
+                    output.write(b"data")
+            ftp, _master = self.make_ftp([])
+            ftp.ftp_settings.crccmp_timeout = 120.0
+            ftp.local_file_crc = MagicMock(return_value=1)
+            now = [0.0]
+
+            def slow_crc(_args, timeout=None):
+                if timeout < 15.0:
+                    now[0] += timeout
+                    return MAVFTPReturn("CalcFileCRC32", FtpError.RemoteReplyTimeout)
+                now[0] += 15.0
+                ftp.last_crc = 1
+                return MAVFTPReturn("CalcFileCRC32", FtpError.Success)
+
+            ftp.cmd_crc = MagicMock(side_effect=slow_crc)
+            with patch("pymavlink.mavftp.time.time", side_effect=lambda: now[0]):
+                result = ftp.cmd_crccmp([os.path.join(tempdir, "*.bin"), "/remote"])
+
+        self.assertEqual(result.error_code, FtpError.Fail)
+        self.assertEqual(ftp.crccmp_results[:8], ["MATCH"] * 8)
+        self.assertEqual(ftp.crccmp_results[8:], ["ERROR", "SKIPPED"])
 
     def test_crccmp_records_files_skipped_after_deadline(self):
         """A deadline-expired batch includes an explicit result for every file."""
@@ -3074,8 +3133,8 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(master.replies, [])
         self.assertEqual(self.sent_requests(master)[-1].opcode, OP_RemoveFile)
 
-    def test_delayed_reply_wins_over_a_simultaneous_terminal_timeout(self):
-        """A reply released from RX delay cannot be overwritten by a timeout."""
+    def test_delayed_reply_does_not_clear_timeout_raised_by_same_idle_pass(self):
+        """A delayed reply cannot erase an unrelated timeout raised by idle work."""
         ftp, _master = self.make_ftp([])
         ftp.cmd_rm(["remote"])
 
@@ -3094,7 +3153,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         ftp.idle_task = queue_delayed_reply
         result = ftp.process_ftp_reply("RemoveFile", timeout=1)
 
-        self.assertEqual(result.error_code, FtpError.Success)
+        self.assertEqual(result.error_code, FtpError.RemoteReplyTimeout)
 
     def test_loss_seed_replays_jitter_sequence(self):
         """The loss seed makes latency jitter reproducible between clients."""
