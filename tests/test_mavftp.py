@@ -1697,6 +1697,26 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
                 self.assertEqual(result.error_code, FtpError.InvalidArguments)
                 self.assertEqual(len(master.mav.sent), 1)  # ResetSessions only.
 
+    def test_mutating_commands_reject_invalid_timeouts_before_sending(self):
+        """Invalid public timeouts cannot issue a remote filesystem mutation."""
+        commands = (
+            ("cmd_rm", ["remote"], OP_RemoveFile),
+            ("cmd_rmdir", ["remote"], OP_RemoveDirectory),
+            ("cmd_rename", ["old", "new"], OP_Rename),
+            ("cmd_mkdir", ["remote"], OP_CreateDirectory),
+        )
+        for timeout in (-1, float("nan"), float("inf")):
+            for method_name, args, opcode in commands:
+                with self.subTest(timeout=timeout, command=method_name):
+                    ftp, master = self.make_ftp([])
+
+                    result = getattr(ftp, method_name)(args, timeout=timeout)
+
+                    self.assertEqual(result.error_code, FtpError.InvalidArguments)
+                    self.assertNotIn(
+                        opcode, [request.opcode for request in self.sent_requests(master)]
+                    )
+
     def test_staging_file_preserves_existing_private_destination_mode(self):
         """A private destination remains private while its replacement is staged."""
         previous_umask = os.umask(0o022)
@@ -1879,27 +1899,28 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(ftp.crccmp_results, ["ERROR", "ERROR", "ERROR"])
 
     def test_crccmp_keeps_slow_responsive_crc_results_before_deadline(self):
-        """Slow responsive CRCs use surplus while later files retain a window."""
-        with tempfile.TemporaryDirectory() as tempdir:
-            for index in range(10):
-                with open(os.path.join(tempdir, f"{index}.bin"), "wb") as output:
-                    output.write(b"data")
-            ftp, _master = self.make_ftp([])
-            ftp.ftp_settings.crccmp_timeout = 120.0
-            ftp.local_file_crc = MagicMock(return_value=1)
-            now = [0.0]
+        """A responsive CRC may use batch time beyond its five-second default."""
+        local_files = [f"local/{index}.bin" for index in range(10)]
+        ftp, _master = self.make_ftp([])
+        ftp.ftp_settings.crccmp_timeout = 120.0
+        ftp.local_file_crc = MagicMock(return_value=1)
+        now = [0.0]
 
-            def slow_crc(_args, timeout=None):
-                if timeout < 15.0:
-                    now[0] += timeout
-                    return MAVFTPReturn("CalcFileCRC32", FtpError.RemoteReplyTimeout)
-                now[0] += 15.0
-                ftp.last_crc = 1
-                return MAVFTPReturn("CalcFileCRC32", FtpError.Success)
+        def slow_crc(_args, timeout=None):
+            if timeout < 15.0:
+                now[0] += timeout
+                return MAVFTPReturn("CalcFileCRC32", FtpError.RemoteReplyTimeout)
+            now[0] += 15.0
+            ftp.last_crc = 1
+            return MAVFTPReturn("CalcFileCRC32", FtpError.Success)
 
-            ftp.cmd_crc = MagicMock(side_effect=slow_crc)
-            with patch("pymavlink.mavftp.time.time", side_effect=lambda: now[0]):
-                result = ftp.cmd_crccmp([os.path.join(tempdir, "*.bin"), "/remote"])
+        ftp.cmd_crc = MagicMock(side_effect=slow_crc)
+        with (
+            patch("pymavlink.mavftp.glob.glob", return_value=local_files),
+            patch("pymavlink.mavftp.os.path.isfile", return_value=True),
+            patch("pymavlink.mavftp.time.time", side_effect=lambda: now[0]),
+        ):
+            result = ftp.cmd_crccmp(["local/*.bin", "/remote"])
 
         self.assertEqual(result.error_code, FtpError.Fail)
         self.assertEqual(ftp.crccmp_results[:8], ["MATCH"] * 8)
@@ -2744,6 +2765,23 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(process_reply.call_args.args, ("ListDirectory",))
         self.assertAlmostEqual(process_reply.call_args.kwargs["timeout"], 60.02)
 
+    def test_baseline_listing_uses_the_full_initial_retry_budget(self):
+        """A non-timestamp listing has enough time for every initial retry."""
+        ftp, _master = self.make_ftp([], list_time=0)
+        ftp.process_ftp_reply = MagicMock(
+            return_value=MAVFTPReturn("ListDirectory", FtpError.Success)
+        )
+
+        with patch.object(
+            ftp, "_MAVFTP__initial_request_retry_budget", return_value=11.0
+        ):
+            result = ftp.cmd_list([])
+
+        self.assertEqual(result.error_code, FtpError.Success)
+        ftp.process_ftp_reply.assert_called_once_with(
+            "ListDirectory", timeout=11.0
+        )
+
     def test_timestamp_nack_fail_does_not_latch_extension_as_unsupported(self):
         """A generic timestamp NACK falls back once but keeps future probes enabled."""
         ftp, master = self.make_ftp(
@@ -2769,7 +2807,7 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         )
 
     def test_open_retry_exhaustion_sets_terminal_timeout_for_reply_loop(self):
-        """The final failed OpenFileRO retry is returned as a remote timeout."""
+        """The final failed OpenFileRO retry sets the reply-loop timeout latch."""
         ftp, _master = self.make_ftp([])
         ftp.cmd_get(["remote", "-"])
         # Keep this focused on the terminal result from the OpenFileRO cap;
@@ -2778,21 +2816,100 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         ftp.op_start = 0.0
         ftp.open_retries = MAX_READ_RETRIES
         terminate = MagicMock()
-        ftp._MAVFTP__terminate_session = terminate
 
-        with patch("pymavlink.mavftp.time.time", return_value=1.0):
-            result = ftp.process_ftp_reply("get", timeout=1.0)
+        with (
+            patch.object(ftp, "_MAVFTP__terminate_session", terminate),
+            patch("pymavlink.mavftp.time.time", return_value=1.0),
+        ):
+            self.assertFalse(ftp.idle_task())
 
-        self.assertEqual(result.error_code, FtpError.RemoteReplyTimeout)
+        self.assertTrue(ftp.terminal_timeout)
         terminate.assert_called_once()
 
-    def test_process_reply_clears_its_initial_request_deadline(self):
-        """A completed reply loop cannot leave a stale retry deadline behind."""
+    def test_process_reply_does_not_expose_an_unused_initial_request_deadline(self):
+        """Retry-deadline implementation detail is not retained as dead state."""
         ftp, _master = self.make_ftp([])
 
-        ftp.process_ftp_reply("RemoveFile", timeout=0.01)
+        self.assertFalse(hasattr(ftp, "initial_request_deadline"))
 
-        self.assertIsNone(ftp.initial_request_deadline)
+    def test_process_reply_honors_an_explicit_initial_request_timeout(self):
+        """An explicit reply-loop timeout is never replaced with a retry budget."""
+        ftp, _master = self.make_ftp([])
+        ftp.last_op = FTP_OP(1, 0, OP_RemoveFile, 1, 0, 0, 0, bytearray(b"x"))
+        ftp.idle_task = MagicMock(return_value=True)
+
+        with patch.object(
+            ftp,
+            "_MAVFTP__initial_request_retry_budget",
+            side_effect=AssertionError("explicit timeout was overridden"),
+        ):
+            result = ftp.process_ftp_reply("RemoveFile", timeout=1.0)
+
+        self.assertEqual(result.error_code, FtpError.Fail)
+
+    def test_default_put_reply_loop_uses_the_create_file_retry_budget(self):
+        """An omitted put timeout leaves time for the CreateFile retry ladder."""
+        ftp, _master = self.make_ftp([])
+        self.assertEqual(
+            ftp.cmd_put(["local", "remote"], fh=BytesIO(b"data")).error_code,
+            FtpError.Success,
+        )
+        ftp.idle_task = MagicMock(return_value=True)
+
+        with patch.object(
+            ftp, "_MAVFTP__initial_request_retry_budget", return_value=11.0
+        ) as retry_budget:
+            result = ftp.process_ftp_reply("put")
+
+        self.assertEqual(result.error_code, FtpError.Fail)
+        retry_budget.assert_called_once_with()
+
+    def test_mutating_commands_request_the_full_initial_retry_budget(self):
+        """Default mutation commands opt into the complete retry ladder."""
+        commands = (
+            ("cmd_rm", ["remote"], "RemoveFile"),
+            ("cmd_rmdir", ["remote"], "RemoveDirectory"),
+            ("cmd_rename", ["old", "new"], "Rename"),
+            ("cmd_mkdir", ["remote"], "CreateDirectory"),
+        )
+        for method_name, args, operation_name in commands:
+            with self.subTest(command=method_name):
+                ftp, _master = self.make_ftp([])
+                ftp.process_ftp_reply = MagicMock(
+                    return_value=MAVFTPReturn(operation_name, FtpError.Success)
+                )
+                with patch.object(
+                    ftp, "_MAVFTP__initial_request_retry_budget", return_value=11.0
+                ):
+                    result = getattr(ftp, method_name)(args)
+
+                self.assertEqual(result.error_code, FtpError.Success)
+                ftp.process_ftp_reply.assert_called_once_with(
+                    operation_name, timeout=11.0
+                )
+
+    def test_command_callers_can_override_the_extended_default_timeout(self):
+        """Public command helpers preserve a caller-supplied reply timeout."""
+        commands = (
+            ("cmd_list", [], "ListDirectory"),
+            ("cmd_rm", ["remote"], "RemoveFile"),
+            ("cmd_rmdir", ["remote"], "RemoveDirectory"),
+            ("cmd_rename", ["old", "new"], "Rename"),
+            ("cmd_mkdir", ["remote"], "CreateDirectory"),
+        )
+        for method_name, args, operation_name in commands:
+            with self.subTest(command=method_name):
+                ftp, _master = self.make_ftp([])
+                ftp.process_ftp_reply = MagicMock(
+                    return_value=MAVFTPReturn(operation_name, FtpError.Success)
+                )
+
+                result = getattr(ftp, method_name)(args, timeout=1.0)
+
+                self.assertEqual(result.error_code, FtpError.Success)
+                ftp.process_ftp_reply.assert_called_once_with(
+                    operation_name, timeout=1.0
+                )
 
     def test_timestamp_listing_retries_lost_followup_page(self):
         """A lost page request is retried after timestamp support is confirmed."""
@@ -3549,6 +3666,62 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
         self.assertEqual(ftp.write_last_send, 10.0)
         self.assertEqual(ftp.write_inflight, {1})
 
+    def test_reordered_write_ack_keeps_the_newer_inflight_window(self):
+        """A late ACK cannot release slots after the receive cursor."""
+        ftp, _master = self.make_ftp([])
+        ftp.fh = BytesIO(b"abcd")
+        ftp.filename = "remote"
+        ftp.write_list = {0, 1, 2, 3}
+        ftp.write_block_size = 1
+        ftp.write_total = 4
+        ftp.write_recv_idx = -1
+        ftp.write_inflight = {0, 1, 2, 3}
+        ftp.write_pending = 4
+        ftp.pending_write_replies = {10: 2, 11: 1}
+
+        with patch.object(ftp, "_MAVFTP__send_more_writes"):
+            result = ftp._MAVFTP__handle_write_reply(  # pylint: disable=protected-access
+                FTP_OP(10, 0, OP_Ack, 0, OP_WriteFile, 0, 2, bytearray()),
+                None,
+            )
+            self.assertEqual(result.error_code, FtpError.Success)
+            self.assertEqual(ftp.write_inflight, {3})
+            self.assertEqual(ftp.write_list, {0, 1, 3})
+
+            result = ftp._MAVFTP__handle_write_reply(  # pylint: disable=protected-access
+                FTP_OP(11, 0, OP_Ack, 0, OP_WriteFile, 0, 1, bytearray()),
+                None,
+            )
+
+        self.assertEqual(result.error_code, FtpError.Success)
+        self.assertEqual(ftp.write_recv_idx, 2)
+        self.assertEqual(ftp.write_inflight, {3})
+        self.assertEqual(ftp.write_list, {0, 3})
+
+    def test_stale_write_ack_cannot_release_a_half_ring_inflight_block(self):
+        """A duplicate ACK must not alter the active write window."""
+        ftp, _master = self.make_ftp([])
+        ftp.fh = BytesIO(b"abcd")
+        ftp.filename = "remote"
+        ftp.write_list = {3}
+        ftp.write_block_size = 1
+        ftp.write_total = 4
+        ftp.write_recv_idx = 2
+        ftp.write_inflight = {3}
+        ftp.write_pending = 1
+
+        with patch.object(ftp, "_MAVFTP__send_more_writes") as send_more:
+            result = ftp._MAVFTP__handle_write_reply(  # pylint: disable=protected-access
+                FTP_OP(10, 0, OP_Ack, 0, OP_WriteFile, 0, 0, bytearray()),
+                None,
+            )
+
+        self.assertEqual(result.error_code, FtpError.Success)
+        self.assertEqual(ftp.write_recv_idx, 2)
+        self.assertEqual(ftp.write_inflight, {3})
+        self.assertEqual(ftp.write_list, {3})
+        send_more.assert_not_called()
+
     def test_process_timeout_terminates_active_session(self):
         """A reply-loop timeout closes an opened remote file session."""
         ftp, _master = self.make_ftp([])
@@ -4221,6 +4394,23 @@ class TestMAVFTPReplyCompletion(unittest.TestCase):  # pylint: disable=too-many-
 
         self.assertEqual(ftp.read_gaps, [])
         self.assertEqual(ftp.get_result, b"a" * 80 + b"b" * 80 + b"c" * 80)
+
+    def test_burst_reply_advances_the_next_request_sequence(self):
+        """A new transfer cannot reuse the accepted burst reply's sequence."""
+        ftp, _master = self.make_ftp([])
+        ftp.fh = BytesIO()
+        ftp.filename = "-"
+        ftp.seq = 40
+        ftp.pending_burst_seq = 40
+        ftp.pending_burst_offset = 0
+
+        result = ftp._MAVFTP__handle_burst_read(  # pylint: disable=protected-access
+            FTP_OP(42, 0, OP_Ack, 1, OP_BurstReadFile, 0, 2, bytearray(b"x")),
+            None,
+        )
+
+        self.assertEqual(result.error_code, FtpError.Success)
+        self.assertEqual(ftp.seq, 43)
 
     def test_long_burst_advances_its_trailing_sequence_floor(self):
         """A burst longer than half the uint16 sequence space remains accepted."""
